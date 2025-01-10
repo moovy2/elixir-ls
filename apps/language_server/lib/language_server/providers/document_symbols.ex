@@ -6,13 +6,14 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
   """
 
   alias ElixirLS.LanguageServer.Providers.SymbolUtils
-  alias ElixirLS.LanguageServer.SourceFile
+  alias ElixirLS.LanguageServer.{SourceFile, Parser}
   require ElixirLS.LanguageServer.Protocol, as: Protocol
 
   defmodule Info do
-    defstruct [:type, :name, :location, :children, :selection_location, :symbol]
+    defstruct [:type, :name, :detail, :location, :children, :selection_location, :symbol]
   end
 
+  @macro_defs [:defmacro, :defmacrop, :defguard, :defguardp]
   @defs [:def, :defp, :defmacro, :defmacrop, :defguard, :defguardp, :defdelegate]
 
   @supplementing_attributes [
@@ -24,16 +25,10 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
     :deprecated
   ]
 
-  @max_parser_errors 6
+  def symbols(uri, %Parser.Context{ast: ast, source_file: source_file}, hierarchical) do
+    symbols = extract_modules(ast) |> Enum.reject(&is_nil/1)
 
-  def symbols(uri, text, hierarchical) do
-    case list_symbols(text) do
-      {:ok, symbols} ->
-        {:ok, build_symbols(symbols, uri, text, hierarchical)}
-
-      {:error, :compilation_error} ->
-        {:error, :server_error, "[DocumentSymbols] Compilation error while parsing source file"}
-    end
+    {:ok, build_symbols(symbols, uri, source_file.text, hierarchical)}
   end
 
   defp build_symbols(symbols, uri, text, hierarchical)
@@ -46,13 +41,6 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
     symbols
     |> Enum.map(&build_symbol_information_flat(uri, text, &1))
     |> List.flatten()
-  end
-
-  defp list_symbols(src) do
-    case ElixirSense.string_to_quoted(src, 1, @max_parser_errors, line: 1, token_metadata: true) do
-      {:ok, quoted_form} -> {:ok, extract_modules(quoted_form)}
-      {:error, _error} -> {:error, :compilation_error}
-    end
   end
 
   # Identify and extract the module symbol, and the symbols contained within the module
@@ -80,54 +68,66 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
   # Modules, protocols
 
   defp extract_symbol(_module_name, {defname, location, arguments})
-       when defname in [:defmodule, :defprotocol] do
-    {module_name, module_name_location, module_body} =
+       when defname in [:defmodule, :defprotocol, :defimpl_transformed] do
+    module_info =
       case arguments do
         # Handles `defmodule do\nend` type compile errors
         [[do: module_body]] ->
           # The LSP requires us to return a non-empty name
           case defname do
-            :defmodule -> {"MISSING_MODULE_NAME", nil, module_body}
-            :defprotocol -> {"MISSING_PROTOCOL_NAME", nil, module_body}
+            :defmodule -> {"MISSING_MODULE_NAME", nil, nil, module_body}
+            :defprotocol -> {"MISSING_PROTOCOL_NAME", nil, nil, module_body}
           end
 
         [module_expression, [do: module_body]] ->
-          module_name_location =
+          {module_name_location, symbol} =
             case module_expression do
-              {_, location, _} -> location
-              _ -> nil
+              {_, location, _} -> {location, Macro.to_string(module_expression)}
+              _ -> {nil, nil}
             end
 
           # TODO extract module name location from Code.Fragment.surround_context?
           # TODO better selection ranges for defimpl?
-          {extract_module_name(module_expression), module_name_location, module_body}
+          {extract_module_name(module_expression), symbol, module_name_location, module_body}
+
+        _ ->
+          nil
       end
 
-    mod_defns =
-      case module_body do
-        {:__block__, [], mod_defns} -> mod_defns
-        stmt -> [stmt]
-      end
+    if module_info do
+      {module_name, symbol, module_name_location, module_body} = module_info
 
-    module_symbols =
-      mod_defns
-      |> Enum.map(&extract_symbol(module_name, &1))
-      |> Enum.reject(&is_nil/1)
+      mod_defns =
+        case module_body do
+          {:__block__, [], mod_defns} -> mod_defns
+          stmt -> [stmt]
+        end
 
-    type =
-      case defname do
-        :defmodule -> :module
-        :defprotocol -> :interface
-      end
+      module_symbols =
+        mod_defns
+        |> Enum.map(&extract_symbol(module_name, &1))
+        |> Enum.reject(&is_nil/1)
+        |> Enum.map(fn info ->
+          %{info | location: Keyword.put(info.location, :parent_location, location)}
+        end)
 
-    %Info{
-      type: type,
-      name: module_name,
-      location: location,
-      selection_location: module_name_location,
-      children: module_symbols,
-      symbol: module_name
-    }
+      type =
+        case defname do
+          :defmodule -> :module
+          :defimpl_transformed -> :module
+          :defprotocol -> :interface
+        end
+
+      %Info{
+        type: type,
+        name: symbol || module_name,
+        detail: if(defname == :defimpl_transformed, do: :defimpl, else: defname),
+        location: location,
+        selection_location: module_name_location,
+        children: module_symbols,
+        symbol: symbol || module_name
+      }
+    end
   end
 
   # Protocol implementations
@@ -137,7 +137,7 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
        ) do
     extract_symbol(
       module_name,
-      {:defmodule, location,
+      {:defimpl_transformed, location,
        [[protocol: protocol_expression, implementations: for_expression], [do: module_body]]}
     )
   end
@@ -154,75 +154,91 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
         []
       end
 
-    # TODO there is no end/closing metadata in the AST - use literal encoder
-
     %Info{
       type: :struct,
       name: "#{defname} #{module_name}",
+      detail: defname,
       location: location,
       children: children
     }
   end
 
-  # We skip attributes only supplementoing the symbol
+  # We skip attributes only supplementing the symbol
   defp extract_symbol(_, {:@, _, [{kind, _, _}]}) when kind in @supplementing_attributes, do: nil
 
   # Types
   defp extract_symbol(_current_module, {:@, location, [{type_kind, _, type_expression}]})
        when type_kind in [:type, :typep, :opaque, :callback, :macrocallback] and
               not is_nil(type_expression) do
-    {type_name, type_head_location} =
+    type_name_location =
       case type_expression do
-        [{:"::", _, [{_, type_head_location, _} = type_head | _]}] ->
-          {Macro.to_string(type_head), type_head_location}
+        [{:"::", _, [{name, type_head_location, args} = _type_head | _]}] ->
+          {{name, args}, type_head_location}
 
-        [{:when, _, [{:"::", _, [{_, type_head_location, _} = type_head, _]}, _]}] ->
-          {Macro.to_string(type_head), type_head_location}
+        [{:when, _, [{:"::", _, [{name, type_head_location, args} = _type_head, _]}, _]}] ->
+          {{name, args}, type_head_location}
 
-        [{_, type_head_location, _} = type_head | _] ->
-          {Macro.to_string(type_head), type_head_location}
+        [{name, type_head_location, args} = _type_head | _] ->
+          {{name, args}, type_head_location}
+
+        _ ->
+          nil
       end
 
-    type_name =
-      type_name
-      |> String.replace("\n", "")
+    if type_name_location do
+      {{name, args}, type_head_location} = type_name_location
 
-    type = if type_kind in [:type, :typep, :opaque], do: :class, else: :event
+      type = if type_kind in [:type, :typep, :opaque], do: :class, else: :event
 
-    %Info{
-      type: type,
-      name: "@#{type_kind} #{type_name}",
-      location: location,
-      selection_location: type_head_location,
-      symbol: "#{type_name}",
-      children: []
-    }
+      name_str =
+        try do
+          to_string(name)
+        rescue
+          _ -> "__unknown__"
+        end
+
+      %Info{
+        type: type,
+        name: "#{name_str}/#{length(args || [])}",
+        detail: "@#{type_kind}",
+        location: location,
+        selection_location: type_head_location,
+        symbol: name_str,
+        children: []
+      }
+    end
   end
 
   # @behaviour BehaviourModule
   defp extract_symbol(_current_module, {:@, location, [{:behaviour, _, [behaviour_expression]}]}) do
-    module_name = extract_module_name(behaviour_expression)
+    module_name = Macro.to_string(behaviour_expression)
 
     %Info{type: :interface, name: "@behaviour #{module_name}", location: location, children: []}
   end
 
   # Other attributes
-  defp extract_symbol(_current_module, {:@, location, [{name, _, _}]}) do
-    %Info{type: :constant, name: "@#{name}", location: location, children: []}
+  defp extract_symbol(_current_module, {:@, location, [{name, _, _}]}) when is_atom(name) do
+    %Info{type: :enum_member, name: "@#{name}", location: location, children: []}
   end
 
   # Function, macro, guard with when
   defp extract_symbol(
          _current_module,
-         {defname, location, [{:when, _, [{_, head_location, _} = fn_head, _]} | _]}
+         {defname, location, [{:when, _, [{name, head_location, args} = _fn_head, _]} | _]}
        )
        when defname in @defs do
-    name = Macro.to_string(fn_head) |> String.replace("\n", "")
+    name_str =
+      try do
+        to_string(name)
+      rescue
+        _ -> "__unknown__"
+      end
 
     %Info{
-      type: :function,
-      symbol: "#{name}",
-      name: "#{defname} #{name}",
+      type: if(defname in @macro_defs, do: :constant, else: :function),
+      symbol: name_str,
+      name: "#{name_str}/#{length(args || [])}",
+      detail: defname,
       location: location,
       selection_location: head_location,
       children: []
@@ -230,14 +246,23 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
   end
 
   # Function, macro, delegate
-  defp extract_symbol(_current_module, {defname, location, [{_, head_location, _} = fn_head | _]})
+  defp extract_symbol(
+         _current_module,
+         {defname, location, [{name, head_location, args} = _fn_head | _]}
+       )
        when defname in @defs do
-    name = Macro.to_string(fn_head) |> String.replace("\n", "")
+    name_str =
+      try do
+        to_string(name)
+      rescue
+        _ -> "__unknown__"
+      end
 
     %Info{
-      type: :function,
-      symbol: "#{name}",
-      name: "#{defname} #{name}",
+      type: if(defname in @macro_defs, do: :constant, else: :function),
+      symbol: name_str,
+      name: "#{name_str}/#{length(args || [])}",
+      detail: defname,
       location: location,
       selection_location: head_location,
       children: []
@@ -262,7 +287,8 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
 
     %Info{
       type: :class,
-      name: "defrecord #{name}",
+      name: "#{name}",
+      detail: :defrecord,
       location: location |> Keyword.merge(Keyword.take(alias_location, [:line, :column])),
       children: children
     }
@@ -272,7 +298,8 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
   defp extract_symbol(_current_module, {:test, location, [name | _]}) do
     %Info{
       type: :function,
-      name: "test #{Macro.to_string(name)}",
+      name: Macro.to_string(name),
+      detail: :test,
       location: location,
       children: []
     }
@@ -304,7 +331,8 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
 
     %Info{
       type: :function,
-      name: "describe #{Macro.to_string(name)}",
+      name: Macro.to_string(name),
+      detail: :describe,
       location: location,
       children: module_symbols
     }
@@ -318,6 +346,7 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
         list when is_list(list) ->
           string_list =
             list
+            |> Enum.filter(&match?({_key, _}, &1))
             |> Enum.map_join(", ", fn {key, _} -> Macro.to_string(key) end)
 
           "[#{string_list}]"
@@ -340,8 +369,15 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
     do: Enum.map(info, &build_symbol_information_hierarchical(uri, text, &1))
 
   defp build_symbol_information_hierarchical(uri, text, %Info{} = info) do
+    selection_location =
+      if info.selection_location && Keyword.has_key?(info.selection_location, :column) do
+        info.selection_location
+      else
+        info.location
+      end
+
     selection_range =
-      location_to_range(info.selection_location || info.location, text, info.symbol)
+      location_to_range(selection_location, text, info.symbol)
 
     # range must contain selection range
     range =
@@ -350,6 +386,7 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
 
     %Protocol.DocumentSymbol{
       name: info.name,
+      detail: info.detail,
       kind: SymbolUtils.symbol_kind_to_code(info.type),
       range: range,
       selectionRange: selection_range,
@@ -433,30 +470,68 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
   end
 
   defp location_to_range(location, text, symbol) do
+    lines = SourceFile.lines(text)
+
     {start_line, start_character} =
-      SourceFile.elixir_position_to_lsp(text, {location[:line], location[:column]})
+      SourceFile.elixir_position_to_lsp(lines, {location[:line], location[:column]})
 
     {end_line, end_character} =
       cond do
         end_location = location[:end_of_expression] ->
-          SourceFile.elixir_position_to_lsp(text, {end_location[:line], end_location[:column]})
+          SourceFile.elixir_position_to_lsp(lines, {end_location[:line], end_location[:column]})
 
         end_location = location[:end] ->
           SourceFile.elixir_position_to_lsp(
-            text,
+            lines,
             {end_location[:line], end_location[:column] + 3}
           )
 
         end_location = location[:closing] ->
-          # all closing tags we expect hera are 1 char width
+          # all closing tags we expect here are 1 char width
           SourceFile.elixir_position_to_lsp(
-            text,
+            lines,
             {end_location[:line], end_location[:column] + 1}
           )
 
         symbol != nil ->
-          end_char = SourceFile.elixir_character_to_lsp(symbol, String.length(symbol))
+          end_char = SourceFile.elixir_character_to_lsp(symbol, String.length(to_string(symbol)))
           {start_line, start_character + end_char + 1}
+
+        parent_end_line =
+            location
+            |> Keyword.get(:parent_location, [])
+            |> Keyword.get(:end, [])
+            |> Keyword.get(:line) ->
+          # last expression in block does not have end_of_expression
+          parent_do_line = location[:parent_location][:do][:line]
+
+          if parent_end_line > parent_do_line do
+            # take end location from parent and assume end_of_expression is last char in previous line
+            end_of_expression =
+              (Enum.at(lines, max(parent_end_line - 2, 0)) || "")
+              |> String.length()
+
+            SourceFile.elixir_position_to_lsp(
+              lines,
+              {parent_end_line - 1, end_of_expression + 1}
+            )
+          else
+            # take end location from parent and assume end_of_expression is last char before final ; trimmed
+            line = Enum.at(lines, parent_end_line - 1)
+            parent_end_column = location[:parent_location][:end][:column]
+
+            end_of_expression =
+              line
+              |> String.slice(0..(parent_end_column - 2))
+              |> String.trim_trailing()
+              |> String.replace_trailing(";", "")
+              |> String.length()
+
+            SourceFile.elixir_position_to_lsp(
+              lines,
+              {parent_end_line, end_of_expression + 1}
+            )
+          end
 
         true ->
           {start_line, start_character}
@@ -475,26 +550,17 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
     "[" <> list_stringified <> "]"
   end
 
-  defp extract_module_name({:__aliases__, location, [{:__MODULE__, _, nil} = head | tail]}) do
-    extract_module_name(head) <> "." <> extract_module_name({:__aliases__, location, tail})
-  end
-
-  defp extract_module_name({:__aliases__, _location, module_names}) do
-    Enum.join(module_names, ".")
-  end
-
-  defp extract_module_name({:__MODULE__, _location, nil}) do
-    "__MODULE__"
-  end
-
   defp extract_module_name(module) when is_atom(module) do
     case Atom.to_string(module) do
-      "Elixir." <> elixir_module_rest -> elixir_module_rest
-      erlang_module -> erlang_module
+      "Elixir." <> elixir_module_rest ->
+        elixir_module_rest
+
+      erlang_module ->
+        erlang_module
     end
   end
 
-  defp extract_module_name(_), do: "# unknown"
+  defp extract_module_name(other), do: Macro.to_string(other)
 
   defp extract_property(property_name, location) when is_atom(property_name) do
     %Info{

@@ -2,9 +2,8 @@ defmodule ElixirLS.LanguageServer.Tracer do
   @moduledoc """
   """
   use GenServer
+  alias ElixirLS.LanguageServer.JsonRpc
   require Logger
-
-  @version 3
 
   @tables ~w(modules calls)a
 
@@ -18,12 +17,8 @@ defmodule ElixirLS.LanguageServer.Tracer do
     GenServer.start_link(__MODULE__, args, name: __MODULE__)
   end
 
-  def set_project_dir(project_dir) do
-    GenServer.call(__MODULE__, {:set_project_dir, project_dir})
-  end
-
-  def save() do
-    GenServer.cast(__MODULE__, :save)
+  def notify_settings_stored(project_dir) do
+    GenServer.cast(__MODULE__, {:notify_settings_stored, project_dir})
   end
 
   defp get_project_dir() do
@@ -39,8 +34,7 @@ defmodule ElixirLS.LanguageServer.Tracer do
   end
 
   def notify_file_deleted(file) do
-    delete_modules_by_file(file)
-    delete_calls_by_file(file)
+    GenServer.cast(__MODULE__, {:notify_file_deleted, file})
   end
 
   @impl true
@@ -56,102 +50,74 @@ defmodule ElixirLS.LanguageServer.Tracer do
       ])
     end
 
-    {:ok, %{project_dir: nil}}
+    state = %{project_dir: nil}
+
+    {:ok, state}
   end
 
   @impl true
-  def handle_call({:set_project_dir, project_dir}, _from, state) do
-    maybe_close_tables(state)
-
-    for table <- @tables do
-      table_name = table_name(table)
-      :ets.delete_all_objects(table_name)
-    end
-
-    if project_dir != nil do
-      {us, _} =
-        :timer.tc(fn ->
-          for table <- @tables do
-            init_table(table, project_dir)
-          end
-        end)
-
-      Logger.info("Loaded DETS databases in #{div(us, 1000)}ms")
-    end
-
-    {:reply, :ok, %{state | project_dir: project_dir}}
-  end
-
   def handle_call(:get_project_dir, _from, %{project_dir: project_dir} = state) do
     {:reply, project_dir, state}
   end
 
   @impl true
+  def handle_cast({:notify_settings_stored, project_dir}, state) do
+    for table <- @tables do
+      table_name = table_name(table)
+      :ets.delete_all_objects(table_name)
+    end
+
+    {:noreply, %{state | project_dir: project_dir}}
+  end
+
+  def handle_cast({:notify_file_deleted, file}, state) do
+    delete_modules_by_file(file)
+    delete_calls_by_file(file)
+    {:noreply, state}
+  end
+
   def handle_cast(:save, %{project_dir: nil} = state) do
     {:noreply, state}
   end
 
-  def handle_cast(:save, %{project_dir: project_dir} = state) do
-    for table <- @tables do
-      table_name = table_name(table)
-
-      sync(table_name)
-    end
-
-    write_manifest(project_dir)
-
-    {:noreply, state}
-  end
-
   @impl true
-  def terminate(_reason, state) do
-    maybe_close_tables(state)
-  end
-
-  defp maybe_close_tables(%{project_dir: nil}), do: :ok
-
-  defp maybe_close_tables(%{project_dir: project_dir}) do
-    for table <- @tables do
-      close_table(table, project_dir)
-    end
-
-    :ok
-  end
-
-  defp dets_path(project_dir, table) do
-    Path.join([project_dir, ".elixir_ls", "#{table}.dets"])
-  end
-
-  def init_table(table, project_dir) do
-    table_name = table_name(table)
-    path = dets_path(project_dir, table)
-
-    {:ok, _} =
-      :dets.open_file(table_name,
-        file: path |> String.to_charlist(),
-        auto_save: 60_000
-      )
-
-    case :dets.to_ets(table_name, table_name) do
-      ^table_name ->
+  def terminate(reason, _state) do
+    case reason do
+      :normal ->
         :ok
 
-      {:error, reason} ->
-        Logger.error("Unable to load DETS #{path}, #{inspect(reason)}")
-    end
-  end
-
-  def close_table(table, project_dir) do
-    path = dets_path(project_dir, table)
-    table_name = table_name(table)
-    sync(table_name)
-
-    case :dets.close(table_name) do
-      :ok ->
+      :shutdown ->
         :ok
 
-      {:error, reason} ->
-        Logger.error("Unable to close DETS #{path}, #{inspect(reason)}")
+      {:shutdown, _} ->
+        :ok
+
+      _other ->
+        ElixirLS.LanguageServer.Server.do_sanity_check()
+        message = Exception.format_exit(reason)
+
+        JsonRpc.telemetry(
+          "lsp_server_error",
+          %{
+            "elixir_ls.lsp_process" => inspect(__MODULE__),
+            "elixir_ls.lsp_server_error" => message
+          },
+          %{}
+        )
+
+        JsonRpc.show_message(
+          :error,
+          "Tracer process exited due to critical error"
+        )
+
+        Logger.error("Terminating #{__MODULE__}: #{message}")
+
+        unless :persistent_term.get(:language_server_test_mode, false) do
+          Process.sleep(2000)
+          System.halt(1)
+        else
+          IO.warn("Terminating #{__MODULE__}: #{message}")
+        end
     end
   end
 
@@ -171,14 +137,28 @@ defmodule ElixirLS.LanguageServer.Tracer do
     ms = modules_by_file_matchspec(file, :"$_")
     # ms = :ets.fun2ms(fn {_, map} when :erlang.map_get(:file, map) == file -> map end)
 
-    :ets.select(table_name(:modules), ms)
+    table = table_name(:modules)
+    :ets.safe_fixtable(table, true)
+
+    try do
+      :ets.select(table, ms)
+    after
+      :ets.safe_fixtable(table, false)
+    end
   end
 
   def delete_modules_by_file(file) do
     ms = modules_by_file_matchspec(file, true)
     # ms = :ets.fun2ms(fn {_, map} when :erlang.map_get(:file, map) == file -> true end)
 
-    :ets.select_delete(table_name(:modules), ms)
+    table = table_name(:modules)
+    :ets.safe_fixtable(table, true)
+
+    try do
+      :ets.select_delete(table, ms)
+    after
+      :ets.safe_fixtable(table, false)
+    end
   end
 
   def trace(:start, %Macro.Env{} = env) do
@@ -225,17 +205,16 @@ defmodule ElixirLS.LanguageServer.Tracer do
   defp build_module_info(module, file, line) do
     defs =
       for {name, arity} <- Module.definitions_in(module) do
-        def_info = apply(Module, :get_definition, [module, {name, arity}])
+        def_info = Module.get_definition(module, {name, arity})
         {{name, arity}, build_def_info(def_info)}
       end
 
     attributes =
-      if Version.match?(System.version(), ">= 1.13.0") do
-        for name <- apply(Module, :attributes_in, [module]) do
-          {name, Module.get_attribute(module, name)}
-        end
-      else
-        []
+      for name <- Module.attributes_in(module) do
+        # reading attribute value here breaks unused attributes warnings
+        # https://github.com/elixir-lang/elixir/issues/13168
+        # {name, Module.get_attribute(module, name)}
+        {name, nil}
       end
 
     %{
@@ -282,26 +261,23 @@ defmodule ElixirLS.LanguageServer.Tracer do
   end
 
   def get_trace do
-    # TODO get by calee
-    :ets.tab2list(table_name(:calls))
-    |> Enum.map(fn {{callee, file, line, column}, _} ->
-      %{
-        callee: callee,
-        file: file,
-        line: line,
-        column: column
-      }
-    end)
-    |> Enum.group_by(fn %{callee: callee} -> callee end)
-  end
+    # TODO get by callee
+    table = table_name(:calls)
+    :ets.safe_fixtable(table, true)
 
-  defp sync(table_name) do
-    with :ok <- :dets.from_ets(table_name, table_name),
-         :ok <- :dets.sync(table_name) do
-      :ok
-    else
-      {:error, reason} ->
-        Logger.error("Unable to sync DETS #{table_name}, #{inspect(reason)}")
+    try do
+      :ets.tab2list(table)
+      |> Enum.map(fn {{callee, file, line, column}, _} ->
+        %{
+          callee: callee,
+          file: file,
+          line: line,
+          column: column
+        }
+      end)
+      |> Enum.group_by(fn %{callee: callee} -> callee end)
+    after
+      :ets.safe_fixtable(table, false)
     end
   end
 
@@ -330,42 +306,26 @@ defmodule ElixirLS.LanguageServer.Tracer do
   def get_calls_by_file(file) do
     ms = calls_by_file_matchspec(file, :"$_")
 
-    :ets.select(table_name(:calls), ms)
+    table = table_name(:calls)
+    :ets.safe_fixtable(table, true)
+
+    try do
+      :ets.select(table, ms)
+    after
+      :ets.safe_fixtable(table, false)
+    end
   end
 
   def delete_calls_by_file(file) do
     ms = calls_by_file_matchspec(file, true)
 
-    :ets.select_delete(table_name(:calls), ms)
-  end
+    table = table_name(:calls)
+    :ets.safe_fixtable(table, true)
 
-  defp manifest_path(project_dir) do
-    Path.join([project_dir, ".elixir_ls", "tracer_db.manifest"])
-  end
-
-  def write_manifest(project_dir) do
-    path = manifest_path(project_dir)
-    File.rm_rf!(path)
-    File.write!(path, "#{@version}")
-  end
-
-  def read_manifest(project_dir) do
-    with {:ok, text} <- File.read(manifest_path(project_dir)),
-         {version, ""} <- Integer.parse(text) do
-      version
-    else
-      _ -> nil
+    try do
+      :ets.select_delete(table, ms)
+    after
+      :ets.safe_fixtable(table, false)
     end
-  end
-
-  def manifest_version_current?(project_dir) do
-    read_manifest(project_dir) == @version
-  end
-
-  def clean_dets(project_dir) do
-    for path <-
-          Path.join([project_dir, ".elixir_ls/*.dets"])
-          |> Path.wildcard(),
-        do: File.rm_rf!(path)
   end
 end

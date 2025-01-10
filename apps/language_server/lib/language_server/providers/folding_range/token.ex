@@ -6,7 +6,6 @@ defmodule ElixirLS.LanguageServer.Providers.FoldingRange.Token do
   """
 
   alias ElixirSense.Core.Normalized.Tokenizer
-  require Logger
 
   @type t :: {atom(), {non_neg_integer(), non_neg_integer(), any()}, any()}
 
@@ -21,7 +20,7 @@ defmodule ElixirLS.LanguageServer.Providers.FoldingRange.Token do
     reversed_tokens
     # This reverses the tokens, but they come out of Tokenizer.tokenize/1
     # already reversed.
-    |> Enum.reduce_while({:ok, []}, fn tuple, {:ok, acc} ->
+    |> Enum.reduce([], fn tuple, acc ->
       tuple =
         case tuple do
           {a, {b1, b2, b3}} ->
@@ -33,31 +32,14 @@ defmodule ElixirLS.LanguageServer.Providers.FoldingRange.Token do
           {:sigil, {b1, b2, b3}, _, _, _, _, delimiter} ->
             {:sigil, {b1 - 1, b2 - 1, b3}, delimiter}
 
-          # Older versions of Tokenizer.tokenize/1
-          {:sigil, {b1, b2, b3}, _, _, _, delimiter} ->
-            {:sigil, {b1 - 1, b2 - 1, b3}, delimiter}
-
           {:bin_heredoc, {b1, b2, b3}, _, _} ->
             {:bin_heredoc, {b1 - 1, b2 - 1, b3}, nil}
 
           {:list_heredoc, {b1, b2, b3}, _, _} ->
             {:list_heredoc, {b1 - 1, b2 - 1, b3}, nil}
-
-          # raise here?
-          error ->
-            Logger.warn("Unmatched token: #{inspect(error)}")
-            :error
         end
 
-      if tuple == :error do
-        {:halt, :error}
-      else
-        {:cont, {:ok, [tuple | acc]}}
-      end
+      [tuple | acc]
     end)
-    |> case do
-      {:ok, formatted_tokens} -> formatted_tokens
-      _ -> []
-    end
   end
 end
