@@ -1,5 +1,31 @@
 ### Unreleased
 
+### v0.30.0: 16 November 2025
+
+#### Highlights
+
+- Added support for elixir 1.19 (and OTP 28 on 1.19)
+
+#### Improvements
+
+- `Code.ensure_compiled` calls removed from the codebase. There should be less hangs related to compilation and code server congestion on elixir 1.18+
+- Mix installer fixes ported from upstream. This should resolve issue with too long paths on Windows
+- Added support for `excludes` in `.formatter.exs`
+- ElixirLS startup script now unsets `MIX_OS_DEPS_COMPILE_PARTITION_COUNT` as a workaround for mix polluting stdout and breaking JasonRPC communication
+- Added support for `stream_data` property tests in test tracer [James E. A.](https://github.com/James-E-A)
+- Added workaround for elixir crash when formatting test failure in debug adapter
+- Added support for elixir 1.19 `not in` token format
+- Ported upstream improvements to `dbg` macro support in debug adapter
+
+#### Fixes
+
+- Resolved infinite loop in fish shell launch script
+- Fixed crash in call hierarchy provider on anonymous calls
+
+#### Breaking changes
+
+- elixir 1.14 reached end of life and is no longer supported. Consider updating to 1.15+
+
 ### v0.29.3: 20 August 2025
 
 #### Fixes
