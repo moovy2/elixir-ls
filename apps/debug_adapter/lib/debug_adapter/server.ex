@@ -81,9 +81,10 @@ defmodule ElixirLS.DebugAdapter.Server do
   def dbg({:|>, _meta, _args} = ast, options, %Macro.Env{} = env) when is_list(options) do
     [first_ast_chunk | asts_chunks] = ast |> Macro.unpipe() |> chunk_pipeline_asts_by_line(env)
 
-    initial_acc = [
+    {first_line, _max_line} = line_range(ast, env.line)
+
+    prelude =
       quote do
-        env = __ENV__
         options = unquote(options)
 
         options =
@@ -93,9 +94,6 @@ defmodule ElixirLS.DebugAdapter.Server do
             options
           end
 
-        env = unquote(env_with_line_from_asts(first_ast_chunk))
-
-        next? = unquote(__MODULE__).__next__(true, binding(), env)
         value = unquote(pipe_chunk_of_asts(first_ast_chunk))
 
         unquote(__MODULE__).__dbg_pipe_step__(
@@ -105,16 +103,12 @@ defmodule ElixirLS.DebugAdapter.Server do
           options
         )
       end
-    ]
 
-    for asts_chunk <- asts_chunks, reduce: initial_acc do
-      ast_acc ->
+    main_block =
+      for asts_chunk <- asts_chunks do
         piped_asts = pipe_chunk_of_asts([{quote(do: value), _index = 0}] ++ asts_chunk)
 
         quote do
-          unquote(ast_acc)
-          env = unquote(env_with_line_from_asts(asts_chunk))
-          next? = unquote(__MODULE__).__next__(next?, binding(), env)
           value = unquote(piped_asts)
 
           unquote(__MODULE__).__dbg_pipe_step__(
@@ -124,7 +118,9 @@ defmodule ElixirLS.DebugAdapter.Server do
             options
           )
         end
-    end
+      end
+
+    annotate_quoted({:__block__, [], [prelude | main_block]}, true, %{env | line: first_line})
   end
 
   def dbg(code, options, %Macro.Env{} = caller) do
@@ -3309,22 +3305,6 @@ defmodule ElixirLS.DebugAdapter.Server do
   defp unwrap_block(expr), do: expr |> unwrap_block([]) |> Enum.reverse()
   defp unwrap_block({:__block__, _, exprs}, acc), do: Enum.reduce(exprs, acc, &unwrap_block/2)
   defp unwrap_block(expr, acc), do: [expr | acc]
-
-  defp env_with_line_from_asts(asts) do
-    line =
-      Enum.find_value(asts, fn
-        {{_fun_or_var, meta, _args}, _pipe_index} -> meta[:line]
-        {_ast, _pipe_index} -> nil
-      end)
-
-    if line do
-      quote do
-        %{env | line: unquote(line)}
-      end
-    else
-      quote do: env
-    end
-  end
 
   defp handle_request_async(packet, start_time, func) do
     parent = self()
