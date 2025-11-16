@@ -128,6 +128,8 @@ defmodule ElixirLS.DebugAdapter.Server do
   end
 
   def dbg(code, options, %Macro.Env{} = caller) do
+    options = Keyword.put(options, :print_location, false)
+
     quote do
       {:current_stacktrace, stacktrace} = Process.info(self(), :current_stacktrace)
       GenServer.call(unquote(__MODULE__), {:dbg, binding(), __ENV__, stacktrace}, :infinity)
@@ -135,7 +137,70 @@ defmodule ElixirLS.DebugAdapter.Server do
     end
   end
 
-  def __next__(next?, binding, opts_or_env) when is_boolean(next?) do
+  @doc """
+  Annotate a quoted expression with line-by-line debugging steps.
+  """
+  @spec annotate_quoted(Macro.t(), Macro.t(), Macro.Env.t()) :: Macro.t()
+  def annotate_quoted(quoted, condition, %Macro.Env{} = caller) do
+    prelude =
+      quote do
+        [
+          env = unquote(Macro.escape(Macro.Env.prune_compile_info(caller))),
+          next? = unquote(condition)
+        ]
+      end
+
+    next_pry =
+      fn line, _version, _binding ->
+        quote do
+          next? = unquote(__MODULE__).__next__(next?, binding(), %{env | line: unquote(line)})
+        end
+      end
+
+    annotate_quoted(quoted, prelude, caller.line, 0, :ok, fn _, _ -> :ok end, next_pry)
+  end
+
+  defp annotate_quoted(maybe_block, prelude, line, version, binding, next_binding, next_pry)
+       when is_list(prelude) do
+    exprs =
+      maybe_block
+      |> unwrap_block()
+      |> annotate_quoted(true, line, version, binding, {next_binding, next_pry})
+
+    {:__block__, [], prelude ++ exprs}
+  end
+
+  defp annotate_quoted([expr | exprs], force?, line, version, binding, funs) do
+    {next_binding, next_pry} = funs
+    new_binding = next_binding.(expr, binding)
+    {min_line, max_line} = line_range(expr, line)
+
+    if force? or min_line > line do
+      [
+        next_pry.(min_line, version, binding),
+        expr | annotate_quoted(exprs, false, max_line, version + 1, new_binding, funs)
+      ]
+    else
+      [expr | annotate_quoted(exprs, false, max_line, version, new_binding, funs)]
+    end
+  end
+
+  defp annotate_quoted([], _force?, _line, _version, _binding, _funs) do
+    []
+  end
+
+  def __next__(next?, binding, opts) when is_boolean(next?) and is_list(opts) do
+    vars = for {key, _} when is_atom(key) <- binding, do: {key, nil}
+
+    env =
+      opts
+      |> Code.env_for_eval()
+      |> :elixir_env.with_vars(vars)
+
+    __next__(next?, binding, env)
+  end
+
+  def __next__(next?, binding, %Macro.Env{} = opts_or_env) when is_boolean(next?) do
     if next? do
       {:current_stacktrace, stacktrace} = Process.info(self(), :current_stacktrace)
 
@@ -3178,6 +3243,72 @@ defmodule ElixirLS.DebugAdapter.Server do
   defp asts_chunk_to_strings(asts) do
     Enum.map(asts, fn {ast, _pipe_index} -> Macro.to_string(ast) end)
   end
+
+  defp line_range(ast, line) do
+    {_, {min, max}} =
+      Macro.prewalk(ast, {:infinity, line}, fn
+        {_, meta, _} = current_ast, {min_line, max_line} when is_list(meta) ->
+          case Keyword.fetch(meta, :line) do
+            {:ok, current_line} when current_line > 0 ->
+              {current_ast, {min(current_line, min_line), max(current_line, max_line)}}
+
+            _ ->
+              {current_ast, {min_line, max_line}}
+          end
+
+        current_ast, acc ->
+          {current_ast, acc}
+      end)
+
+    if min == :infinity, do: {line, max}, else: {min, max}
+  end
+
+  @doc false
+  def next_binding(ast, binding) do
+    {_, binding} =
+      Macro.prewalk(ast, binding, fn
+        {:=, _, [left, _right]}, acc ->
+          {:ok, match_binding(left, acc)}
+
+        {:case, _, [arg, _block]}, acc ->
+          {arg, acc}
+
+        {special_form, _, _}, acc
+        when special_form in [:cond, :fn, :for, :receive, :try, :with] ->
+          {:ok, acc}
+
+        current_ast, acc ->
+          {current_ast, acc}
+      end)
+
+    binding
+  end
+
+  @doc false
+  def match_binding(match, binding) do
+    {_, binding} =
+      Macro.prewalk(match, binding, fn
+        {name, _, nil} = var, acc when name != :_ and is_atom(name) ->
+          {var, Map.put(acc, name, var)}
+
+        {special_form, _, _}, acc when special_form in [:^, :"::"] ->
+          {:ok, acc}
+
+        current_ast, acc ->
+          {current_ast, acc}
+      end)
+
+    binding
+  end
+
+  @doc false
+  def next_var(id) do
+    {:next?, [version: -id], __MODULE__}
+  end
+
+  defp unwrap_block(expr), do: expr |> unwrap_block([]) |> Enum.reverse()
+  defp unwrap_block({:__block__, _, exprs}, acc), do: Enum.reduce(exprs, acc, &unwrap_block/2)
+  defp unwrap_block(expr, acc), do: [expr | acc]
 
   defp env_with_line_from_asts(asts) do
     line =
