@@ -17,5 +17,31 @@ if Version.match?(System.version(), ">= 1.14.0-dev") do
       |> File.exists?()
       |> dbg()
     end
+
+    def pipe_multi_stage() do
+      __ENV__.file
+      |> Path.dirname()
+      |> Path.split()
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.map(&String.upcase/1)
+      |> Enum.join("/")
+      |> dbg()
+    end
+
+    def case_pipe_dbg(arg \\ {:ok, ["a", "b"]}) do
+      case arg do
+        {:ok, list} ->
+          list
+          |> Enum.reverse()
+          |> Enum.map(&String.upcase/1)
+          |> Enum.join("/")
+          |> dbg()
+
+        {:error, reason} ->
+          reason
+          |> Atom.to_string()
+          |> dbg()
+      end
+    end
   end
 end

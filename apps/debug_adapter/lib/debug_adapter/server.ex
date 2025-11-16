@@ -77,6 +77,9 @@ defmodule ElixirLS.DebugAdapter.Server do
     GenServer.cast(server, {:paused, pid})
   end
 
+  # Kernel.dbg backend - adapted from IEx.Pry (lib/iex/lib/iex/pry.ex)
+  # When upgrading Elixir, diff against upstream IEx.Pry.dbg/3 and sync changes.
+  # DAP-specific: Uses GenServer.call to debug adapter instead of IEx.Broker.
   @spec dbg(Macro.t(), Macro.t(), Macro.Env.t()) :: Macro.t()
   def dbg({:|>, _meta, _args} = ast, options, %Macro.Env{} = env) when is_list(options) do
     [first_ast_chunk | asts_chunks] = ast |> Macro.unpipe() |> chunk_pipeline_asts_by_line(env)
@@ -133,6 +136,8 @@ defmodule ElixirLS.DebugAdapter.Server do
     end
   end
 
+  # Copied from IEx.Pry.annotate_quoted/3 - keep in sync with upstream.
+  # DAP-specific: Calls __next__/3 which uses GenServer instead of IEx.Broker.
   @doc """
   Annotate a quoted expression with line-by-line debugging steps.
   """
@@ -185,6 +190,9 @@ defmodule ElixirLS.DebugAdapter.Server do
     []
   end
 
+  # DAP-specific: Unlike IEx.Pry.__next__/3 which calls IEx.Broker,
+  # this uses GenServer.call to the debug adapter to pause execution.
+  # Supports both list options (for IEx.Pry compatibility) and Macro.Env.
   def __next__(next?, binding, opts) when is_boolean(next?) and is_list(opts) do
     vars = for {key, _} when is_atom(key) <- binding, do: {key, nil}
 
@@ -3206,6 +3214,7 @@ defmodule ElixirLS.DebugAdapter.Server do
     end
   end
 
+  # Copied verbatim from IEx.Pry - keep in sync with upstream during Elixir upgrades.
   # Made public to be called from dbg/3 to reduce the amount of generated code.
   @doc false
   def __dbg_pipe_step__(value, string_asts, start_with_pipe?, options) do
@@ -3225,6 +3234,7 @@ defmodule ElixirLS.DebugAdapter.Server do
     value
   end
 
+  # Pipeline helpers copied verbatim from IEx.Pry - keep in sync with upstream.
   defp chunk_pipeline_asts_by_line(asts, %Macro.Env{line: env_line}) do
     Enum.chunk_by(asts, fn
       {{_fun_or_var, meta, _args}, _pipe_index} -> meta[:line] || env_line
@@ -3240,6 +3250,8 @@ defmodule ElixirLS.DebugAdapter.Server do
     Enum.map(asts, fn {ast, _pipe_index} -> Macro.to_string(ast) end)
   end
 
+  # annotate_quoted helpers copied from IEx.Pry - keep in sync with upstream.
+  # Functions: line_range/2, next_binding/2, match_binding/2, next_var/1, unwrap_block/1,2
   defp line_range(ast, line) do
     {_, {min, max}} =
       Macro.prewalk(ast, {:infinity, line}, fn
